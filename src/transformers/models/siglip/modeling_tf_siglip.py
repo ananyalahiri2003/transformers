@@ -641,7 +641,7 @@ class TFSiglipTextTransformer(keras.layers.Layer):
 
 
 @keras_serializable
-class TFCLIPTextMainLayer(keras.layers.Layer):
+class TFSiglipTextMainLayer(keras.layers.Layer):
     config_class = SiglipTextConfig
 
     def __init__(self, config: SiglipTextConfig, **kwargs):
@@ -696,7 +696,7 @@ class TFCLIPTextMainLayer(keras.layers.Layer):
                 self.text_model.build(None)
 
 
-class TFCLIPVisionTransformer(keras.layers.Layer):
+class TFSiglipVisionTransformer(keras.layers.Layer):
     def __init__(self, config: SiglipVisionConfig, **kwargs):
         super().__init__(**kwargs)
 
@@ -714,10 +714,10 @@ class TFCLIPVisionTransformer(keras.layers.Layer):
         output_attentions: bool,
         output_hidden_states: bool,
         return_dict: bool,
+        interpolate_pos_encoding: Optional[bool] = False,
         training: bool = False,
     ) -> Union[TFBaseModelOutputWithPooling, Tuple[tf.Tensor]]:
-        embedding_output = self.embeddings(pixel_values=pixel_values)
-        embedding_output = self.pre_layernorm(inputs=embedding_output)
+        embedding_output = self.embeddings(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
 
         encoder_outputs = self.encoder(
             hidden_states=embedding_output,
@@ -730,16 +730,745 @@ class TFCLIPVisionTransformer(keras.layers.Layer):
         sequence_output = encoder_outputs[0]
         sequence_output = self.post_layernorm(sequence_output)
 
-        pooled_output = self.head(sequence_output) if self.use_head else None
+        pooler_output = self.head(sequence_output) if self.use_head else None
         if not return_dict:
-            return (sequence_output, pooled_output) + encoder_outputs[1:]
+            return (sequence_output, pooler_output) + encoder_outputs[1:]
 
         return TFBaseModelOutputWithPooling(
             last_hidden_state=sequence_output,
-            pooler_output=pooled_output,
+            pooler_output=pooler_output,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "embeddings", None) is not None:
+            with tf.name_scope(self.embeddings.name):
+                self.embeddings.build(None)
+        if getattr(self, "encoder", None) is not None:
+            with tf.name_scope(self.encoder.name):
+                self.encoder.build(None)
+        if getattr(self, "post_layernorm", None) is not None:
+            with tf.name_scope(self.post_layernorm.name):
+                self.post_layernorm.build([None, self.embed_dim])
+
+
+class TFSiglipMultiheadAttentionPoolingHead(keras.layers.Layer):
+    """Multihead Attention Pooling."""
+
+    def __init__(self, config: SiglipVisionConfig, **kwargs):
+        super().__init__(**kwargs)
+        self.config = config
+        self.embed_dim = config.hidden_size
+
+        self.probe = self.add_weight(
+            shape=(1, 1, config.hidden_size),
+            initializer=keras.initializers.RandomNormal(),
+            trainable=True,
+            name="probe"
+        )
+
+        # Multihead Attention Layer
+        self.attention = tf.keras.layers.MultiHeadAttention(
+            num_heads=config.num_attention_heads,
+            key_dim=config.hidden_state,
+            dropout=0.1,
+            batch_first=True,
+            name="multihead_attention",
+        )
+
+        # Layer Norm
+        self.layernorm = tf.keras.layers.LayerNormalization(
+            epsilon=config.layer_norm_eps, name="layernorm"
+        )
+
+        # MLP Layer
+        self.mlp = TFSiglipMLP(config, name="mlp")
+
+    def call(
+            self,
+            pixel_values: TFModelInputType,
+            training: bool = False,
+    ):
+        # Concatenate probe to pixel values
+        batch_size = tf.shape(pixel_values)[0]
+        probe = tf.tile(self.probe, [batch_size, 1, 1])
+        pixel_values_with_probe = tf.concat([probe, pixel_values], axis=1)
+
+        # Multihead attention
+        attention_output = self.attention(
+            query=pixel_values_with_probe,
+            key=pixel_values_with_probe,
+            value=pixel_values_with_probe,
+            training=training
+        )
+
+        # Apply Layer Norm
+        attention_output = self.layernorm(attention_output, training=training)
+
+        # Apply MLP
+        output = self.mlp(attention_output, training=training)
+
+        return output
+x
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "probe", None) is not None:
+            with tf.name_scope(self.probe.name):
+                self.probe.build([None, None, self.config.hidden_size])
+        if getattr(self, "attention", None) is not None:
+            with tf.name_scope(self.attention.name):
+                self.attention.build([None, None, self.config.hidden_size])
+        if getattr(self, "layernorm", None) is not None:
+            with tf.name_scope(self.layernorm.name):
+                self.layernorm.build([None, self.embed_dim])
+        if getattr(self, "mlp", None) is not None:
+            with tf.name_scope(self.mlp.name):
+                self.mlp.build([None, None, self.config.hidden_size])
+
+
+@keras.serializable
+class TFSiglipVisionModel(TFSiglipPreTrainedModel):
+    config_class - SiglipVisionConfig
+    main_input_name = "pixel_values"
+
+    def __init__(self, config: SiglipVisionConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        self.siglip = TFSiglipVisionMainLayer(config, name="siglip")
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(SIGLIP_VISION_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=TFBaseModelOutputWithPooling, config_class=SiglipVisionConfig)
+    def call(
+            self,
+            pixel_values: TFModelInputType | None = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            interpolate_pos_encoding: bool = False,
+            training: Optional[bool] = False,
+    ) -> Union[TFBaseModelOutputWithPooling, Tuple[tf.Tensor]]:
+        r"""
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, TFSiglipVisionModel
+
+        >>> model = TFSiglipVisionModel.from_pretrained("google/siglip-base-patch16-224")
+        >>> processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
+
+        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(images=image, return_tensors="tf")
+
+        >>> outputs = model(**inputs)
+        >>> last_hidden_state = outputs.last_hidden_state
+        >>> pooled_output = outputs.pooler_output  # pooled CLS states
+        ```"""
+
+        outputs = self.siglip(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+            training=training,
+        )
+
+        return outputs
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "siglip", None) is not None:
+            with tf.name_scope(self.siglip.name):
+                self.siglip.build(None)
+
+
+@add_start_docstrings(SIGLIP_START_DOCSTRING)
+class TFSiglipModel(TFSiglipPreTrainedModel):
+    config_class = SiglipConfig
+
+    def __int__(self, config: SiglipConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        self.siglip = TFSiglipMainLayer(config, name="siglip")
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(SIGLIP_TEXT_INPUTS_DOCSTRING)
+    def get_text_features(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: bool = False,
+    ) -> tf.Tensor:
+
+
+
+
+
+
+
+
+
+
+
+
+
+@keras.serializable
+class TFSiglipVisionMainLayer(keras.layers.Layer):
+    config_class = SiglipVisionConfig
+
+    def __init__(self, config: SiglipVisionConfig, **kwargs):
+        super().__init__(**kwargs)
+        self.config = config
+        self.vision_model = TFSiglipVisionTransformer(config, name="vision_model")
+
+    def get_input_embeddings(self) -> keras.layers.Layer:
+        return self.vision_model.embeddings
+
+    @unpack_inputs
+    def call(
+            self,
+            pixel_values: TFModelInputType | None = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            training: bool = False,
+    ) -> Union[TFBaseModelOutputWithPooling, Tuple[tf.Tensor]]:
+        if pixel_values is None:
+            raise ValueError("You have to specify pixel_values")
+
+        vision_model_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        return vision_model_outputs
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "vision_model", None) is not None:
+            with tf.name_scope(self.vision_model.name):
+                self.vision_model.build(None)
+
+
+@keras.serializable
+class TFSiglipMainLayer(keras.layers.Layer):
+    config_class = SiglipConfig
+
+    def __init__(self, config: SiglipConfig, **kwargs):
+        super().__init__(**kwargs)
+
+        if not isinstance(config.text_config, SiglipTextConfig):
+            raise ValueError(
+                "config.text_config is expected to be of type SiglipTextConfig but is of type "
+                f" {type(config.text_config)}."
+            )
+
+        if not isinstance(config.vision_config, SiglipVisionConfig):
+            raise ValueError(
+                "config.vision_config is expected tobe of type SiglipVisionConfig but is of type "
+                f" {type(config.vision_config)}."
+            )
+
+        self.config = config
+
+        text_config = config.text_config
+        vision_config = config.vision_config
+
+        self.projection_dim = config.projection_dim
+
+        self.text_model = TFSiglipTextTransformer(text_config, name="text_model")
+        self.vision_model = TFSiglipVisionTransformer(vision_config, name="vision_model")
+
+        self.visual_projection = keras.layers.Dense(
+            units=self.projection_dim,
+            kernel_initializer=get_initializer(vision_config.hidden_size ** -0.5 * self.config.initializer_factor),
+            use_bias=False,
+            name="visual_projection",
+        )
+
+        self.text_projection = keras.layers.Dense(
+            units=self.projection_dim,
+            kernel_initializer=get_initializer(text_config.hidden_size ** -0.5 * self.config.initializer_factor),
+            use_bias=False,
+            name="text_projection",
+        )
+        self.text_embed_dim = text_config.hidden_size
+        self.vision_embed_dim = vision_config.hidden_size
+
+    # Copied from transformers.models.clip.modeling_clip.TFCLIPMainLayer
+    def build(self, input_shape: tf.TensorShape = None):
+        self.logit_scale = self.add_weight(
+            shape=(1,),
+            initializer=keras.initializers.Constant(self.config.logit_scale_init_value),
+            trainable=True,
+            name="logit_scale",
+        )
+
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "text_model", None) is not None:
+            with tf.name_scope(self.text_model.name):
+                self.text_model.build(None)
+        if getattr(self, "vision_model", None) is not None:
+            with tf.name_scope(self.vision_model.name):
+                self.vision_model.build(None)
+        if getattr(self, "visual_projection", None) is not None:
+            with tf.name_scope(self.visual_projection.name):
+                self.visual_projection.build([None, None, self.vision_embed_dim])
+        if getattr(self, "text_projection", None) is not None:
+            with tf.name_scope(self.text_projection.name):
+                self.text_projection.build([None, None, self.text_embed_dim])
+
+    @unpack_inputs
+    def get_text_features(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: bool = False,
+    ) -> tf.Tensor:
+        if input_ids is None:
+            raise ValueError("You have to specify either input_ids")
+
+        input_shape = shape_list(input_ids)
+
+        if attention_mask is None:
+            attention_mask = tf.fill(dims=input_shape, value=1)
+
+        text_outputs = self.text_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        pooled_output = text_outputs[1]
+        text_features = self.text_projection(inputs=pooled_output)
+
+        return text_features
+
+    @unpack_inputs
+    def get_image_features(
+            self,
+            pixel_values: TFModelInputType | None = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            training: bool = False,
+    ) -> tf.Tensor:
+        if pixel_values is None:
+            raise ValueError("You have to specify pixel_values")
+
+        vision_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        pooled_output = vision_outputs[1]  # pooled_output
+        image_features = self.visual_projection(inputs=pooled_output)
+
+        return image_features
+
+    @unpack_inputs
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        pixel_values: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        return_loss: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: bool = False,
+    ) -> Union[TFSiglipOutput, Tuple[tf.Tensor]]:
+        if input_ids is None:
+            raise ValueError("You have to specify either input_ids")
+        if pixel_values is None:
+            raise ValueError("You have to specify pixel_values")
+
+        input_shape = shape_list(input_ids)
+
+        if attention_mask is None:
+            attention_mask = tf.fill(dims=input_shape, value=1)
+
+        vision_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        text_outputs = self.text_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        image_embeds = vision_outputs[1]
+        image_embeds = self.visual_projection(inputs=image_embeds)
+
+        text_embeds = text_outputs[1]
+        text_embeds = self.text_projection(inputs=text_embeds)
+
+        # normalized features
+        image_embeds = image_embeds / tf.norm(tensor=image_embeds, ord="euclidean", axis=-1, keepdims=True)
+        text_embeds = text_embeds / tf.norm(tensor=text_embeds, ord="euclidean", axis=-1, keepdims=True)
+
+        # cosine similarity as logits
+        logit_scale = tf.math.exp(self.logit_scale)
+        logits_per_text = tf.matmul(text_embeds, image_embeds, transpose_b=True) * logit_scale
+        logits_per_image = tf.transpose(logits_per_text)
+
+        loss = None
+        if return_loss:
+            loss = siglip_loss(logits_per_text)
+            loss = tf.reshape(loss, (1,))
+
+        if not return_dict:
+            output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
+            return (loss,) + output if loss is not None else output
+
+        return TFSiglipOutput(
+            loss=loss,
+            logits_per_image=logits_per_image,
+            logits_per_text=logits_per_text,
+            text_embeds=text_embeds,
+            image_embeds=image_embeds,
+            text_model_output=text_outputs,
+            vision_model_output=vision_outputs,
+        )
+
+
+class TFSiglipPreTrainedModel(TFPreTrainedModel):
+    """
+    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
+    models.
+    """
+
+    config_class = SiglipConfig
+    base_model_prefix = "siglip"
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+    _keys_to_ignore_on_load_unexpected = [r"position_ids"]
+
+
+SIGLIP_START_DOCSTRING = r"""
+
+    This model inherits from [`TFPreTrainedModel`]. Check the superclass documentation for the generic methods the
+    library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
+    etc.)
+
+    This model is also a [keras.Model](https://www.tensorflow.org/api_docs/python/tf/keras/Model) subclass. Use it
+    as a regular TF 2.0 Keras Model and refer to the TF 2.0 documentation for all matter related to general usage and
+    behavior.
+
+    <Tip>
+
+    TensorFlow models and layers in `transformers` accept two formats as input:
+
+    - having all inputs as keyword arguments (like PyTorch models), or
+    - having all inputs as a list, tuple or dict in the first positional argument.
+
+    The reason the second format is supported is that Keras methods prefer this format when passing inputs to models
+    and layers. Because of this support, when using methods like `model.fit()` things should "just work" for you - just
+    pass your inputs and labels in any format that `model.fit()` supports! If, however, you want to use the second
+    format outside of Keras methods like `fit()` and `predict()`, such as when creating your own layers or models with
+    the Keras `Functional` API, there are three possibilities you can use to gather all the input Tensors in the first
+    positional argument:
+
+    - a single Tensor with `input_ids` only and nothing else: `model(input_ids)`
+    - a list of varying length with one or several input Tensors IN THE ORDER given in the docstring:
+    `model([input_ids, attention_mask])` or `model([input_ids, attention_mask, token_type_ids])`
+    - a dictionary with one or several input Tensors associated to the input names given in the docstring:
+    `model({"input_ids": input_ids, "token_type_ids": token_type_ids})`
+
+    Note that when creating models and layers with
+    [subclassing](https://keras.io/guides/making_new_layers_and_models_via_subclassing/) then you don't need to worry
+    about any of this, as you can just pass inputs like you would to any other Python function!
+
+    </Tip>
+
+    Args:
+        config ([`SiglipConfig`]): Model configuration class with all the parameters of the model.
+            Initializing with a config file does not load the weights associated with the model, only the
+            configuration. Check out the [`~TFPreTrainedModel.from_pretrained`] method to load the model weights.
+"""
+
+SIGLIP_TEXT_INPUTS_DOCSTRING = r"""
+    Args:
+        input_ids (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]` ``Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `({0})`):
+            Indices of input sequence tokens in the vocabulary.
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.__call__`] and
+            [`PreTrainedTokenizer.encode`] for details.
+
+            [What are input IDs?](../glossary#input-ids)
+        attention_mask (`np.ndarray` or `tf.Tensor` of shape `({0})`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+            [What are attention masks?](../glossary#attention-mask)
+        position_ids (`np.ndarray` or `tf.Tensor` of shape `({0})`, *optional*):
+            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
+            config.max_position_embeddings - 1]`.
+
+            [What are position IDs?](../glossary#position-ids)
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
+            tensors for more detail. This argument can be used only in eager mode, in graph mode the value in the
+            config will be used instead.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail. This argument can be used only in eager mode, in graph mode the value in the config will be
+            used instead.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple. This argument can be used in
+            eager mode, in graph mode the value will always be set to True.
+        training (`bool`, *optional*, defaults to `False``):
+            Whether or not to use the model in training mode (some modules like dropout modules have different
+            behaviors between training and evaluation).
+"""
+
+SIGLIP_VISION_INPUTS_DOCSTRING = r"""
+    Args:
+        pixel_values (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]` ``Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `(batch_size, num_channels, height, width)`):
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
+            [`CLIPImageProcessor.__call__`] for details. output_attentions (`bool`, *optional*): Whether or not to
+            return the attentions tensors of all attention layers. See `attentions` under returned tensors for more
+            detail. This argument can be used only in eager mode, in graph mode the value in the config will be used
+            instead.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail. This argument can be used only in eager mode, in graph mode the value in the config will be
+            used instead.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple. This argument can be used in
+            eager mode, in graph mode the value will always be set to True.
+        training (`bool`, *optional*, defaults to `False``):
+            Whether or not to use the model in training mode (some modules like dropout modules have different
+            behaviors between training and evaluation).
+"""
+
+SIGLIP_INPUTS_DOCSTRING = r"""
+    Args:
+        input_ids (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]` ``Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `({0})`):
+            Indices of input sequence tokens in the vocabulary.
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.__call__`] and
+            [`PreTrainedTokenizer.encode`] for details.
+
+            [What are input IDs?](../glossary#input-ids)
+        pixel_values (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]` `Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `(batch_size, num_channels, height, width)`):
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
+            [`CLIPImageProcessor.__call__`] for details.
+        attention_mask (`np.ndarray` or `tf.Tensor` of shape `({0})`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+            [What are attention masks?](../glossary#attention-mask)
+        position_ids (`np.ndarray` or `tf.Tensor` of shape `({0})`, *optional*):
+            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
+            config.max_position_embeddings - 1]`.
+
+            [What are position IDs?](../glossary#position-ids)
+        return_loss (`bool`, *optional*):
+            Whether or not to return the contrastive loss.
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
+            tensors for more detail. This argument can be used only in eager mode, in graph mode the value in the
+            config will be used instead.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail. This argument can be used only in eager mode, in graph mode the value in the config will be
+            used instead.
+        interpolate_pos_encoding (`bool`, *optional*, defaults to `False`):
+            Whether to interpolate the pre-trained position encodings. This argument can be used only in eager mode, 
+            in graph mode the value in the config will be used instead.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple. This argument can be used in
+            eager mode, in graph mode the value will always be set to True.
+        training (`bool`, *optional*, defaults to `False``):
+            Whether or not to use the model in training mode (some modules like dropout modules have different
+            behaviors between training and evaluation).
+"""
+
+
+class TFSiglipTextModel(TFSiglipPreTrainedModel):
+    config_class = SiglipTextConfig
+
+    def __init__(self, config: SiglipTextConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        self.siglip = TFSiglipTextMainLayer(config, name="siglip")
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(SIGLIP_TEXT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @replace_return_docstrings(output_type=TFBaseModelOutputWithPooling, config_class=SiglipTextConfig)
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFBaseModelOutputWithPooling, Tuple[tf.Tensor]]:
+        r"""
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> from transformers import AutoTokenizer, TFSiglipTextModel
+
+        >>> model = TFSiglipTextModel.from_pretrained("google/siglip-base-patch16-224")
+        >>> tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-224")
+
+        >>> inputs = tokenizer(["a photo of a cat", "a photo of a dog"], padding=True, return_tensors="tf")
+
+        >>> outputs = model(**inputs)
+        >>> last_hidden_state = outputs.last_hidden_state
+        >>> pooled_output = outputs.pooler_output  # pooled (EOS token) states
+        ```"""
+
+        outputs = self.siglip(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        return outputs
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "siglip", None) is not None:
+            with tf.name_scope(self.siglip.name):
+                self.siglip.build(None)
+
+
+class TFSiglipVisionModel(TFSiglipPreTrainedModel):
+    config_class = SiglipVisionConfig
+    main_input_name = "pixel_values"
+
+    def __init__(self, config: SiglipVisionConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        self.siglip = TFSiglipVisionMainLayer(config, name="siglip")
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(SIGLIP_VISION_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=TFBaseModelOutputWithPooling, config_class=SiglipVisionConfig)
+    def call(
+        self,
+        pixel_values: TFModelInputType | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        interpolate_pos_encoding: bool = False,
+        training: Optional[bool] = False,
+    ) -> Union[TFBaseModelOutputWithPooling, Tuple[tf.Tensor]]:
+        r"""
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, TFSiglipVisionModel
+
+        >>> model = TFSiglipVisionModel.from_pretrained("google/siglip-base-patch16-224")
+        >>> processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
+
+        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(images=image, return_tensors="tf")
+
+        >>> outputs = model(**inputs)
+        >>> last_hidden_state = outputs.last_hidden_state
+        >>> pooled_output = outputs.pooler_output  # pooled CLS states
+        ```"""
+
+        outputs = self.siglip(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+            training=training,
+        )
+
+        return outputs
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "siglip", None) is not None:
+            with tf.name_scope(self.siglip.name):
+                self.siglip.build(None)
+
+
+
+
+
+
+
+
+
+
+
 
 
 

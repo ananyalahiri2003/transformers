@@ -71,6 +71,24 @@ def _expand_mask(mask: tf.Tensor, tgt_len: Optional[int] = None):
     return (one_cst - expanded_mask) * LARGE_NEGATIVE
 
 
+def contrastive_loss(logits: tf.Tensor) -> tf.Tensor:
+    labels = tf.cast(
+        tf.range(shape_list(logits)[0]), dtype=tf.int32
+    )
+    one_hot_labels = tf.one_hot(labels, depth=shape_list(logits)[1])
+    return tf.math.reduce_mean(
+        keras.losses.binary_crossentropy(
+            y_true=one_hot_labels, y_pred=logits, from_logits=True
+        )
+    )
+
+
+def siglip_loss(similarity: tf.Tensor) -> tf.Tensor:
+    caption_loss = contrastive_loss(similarity)
+    image_loss = contrastive_loss(tf.transpose(similarity))
+    return (caption_loss + image_loss )/ 2.0
+
+
 @dataclass
 class TFSiglipOutput(ModelOutput):
     """
@@ -813,7 +831,7 @@ class TFSiglipMultiheadAttentionPoolingHead(keras.layers.Layer):
         output = self.mlp(attention_output, training=training)
 
         return output
-x
+
     def build(self, input_shape=None):
         if self.built:
             return
@@ -830,105 +848,6 @@ x
         if getattr(self, "mlp", None) is not None:
             with tf.name_scope(self.mlp.name):
                 self.mlp.build([None, None, self.config.hidden_size])
-
-
-@keras.serializable
-class TFSiglipVisionModel(TFSiglipPreTrainedModel):
-    config_class - SiglipVisionConfig
-    main_input_name = "pixel_values"
-
-    def __init__(self, config: SiglipVisionConfig, *inputs, **kwargs):
-        super().__init__(config, *inputs, **kwargs)
-
-        self.siglip = TFSiglipVisionMainLayer(config, name="siglip")
-
-    @unpack_inputs
-    @add_start_docstrings_to_model_forward(SIGLIP_VISION_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=TFBaseModelOutputWithPooling, config_class=SiglipVisionConfig)
-    def call(
-            self,
-            pixel_values: TFModelInputType | None = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            interpolate_pos_encoding: bool = False,
-            training: Optional[bool] = False,
-    ) -> Union[TFBaseModelOutputWithPooling, Tuple[tf.Tensor]]:
-        r"""
-        Returns:
-
-        Examples:
-
-        ```python
-        >>> from PIL import Image
-        >>> import requests
-        >>> from transformers import AutoProcessor, TFSiglipVisionModel
-
-        >>> model = TFSiglipVisionModel.from_pretrained("google/siglip-base-patch16-224")
-        >>> processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
-
-        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
-
-        >>> inputs = processor(images=image, return_tensors="tf")
-
-        >>> outputs = model(**inputs)
-        >>> last_hidden_state = outputs.last_hidden_state
-        >>> pooled_output = outputs.pooler_output  # pooled CLS states
-        ```"""
-
-        outputs = self.siglip(
-            pixel_values=pixel_values,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            interpolate_pos_encoding=interpolate_pos_encoding,
-            training=training,
-        )
-
-        return outputs
-
-    def build(self, input_shape=None):
-        if self.built:
-            return
-        self.built = True
-        if getattr(self, "siglip", None) is not None:
-            with tf.name_scope(self.siglip.name):
-                self.siglip.build(None)
-
-
-@add_start_docstrings(SIGLIP_START_DOCSTRING)
-class TFSiglipModel(TFSiglipPreTrainedModel):
-    config_class = SiglipConfig
-
-    def __int__(self, config: SiglipConfig, *inputs, **kwargs):
-        super().__init__(config, *inputs, **kwargs)
-
-        self.siglip = TFSiglipMainLayer(config, name="siglip")
-
-    @unpack_inputs
-    @add_start_docstrings_to_model_forward(SIGLIP_TEXT_INPUTS_DOCSTRING)
-    def get_text_features(
-        self,
-        input_ids: TFModelInputType | None = None,
-        attention_mask: np.ndarray | tf.Tensor | None = None,
-        position_ids: np.ndarray | tf.Tensor | None = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        training: bool = False,
-    ) -> tf.Tensor:
-
-
-
-
-
-
-
-
-
-
-
 
 
 @keras.serializable
@@ -1458,6 +1377,175 @@ class TFSiglipVisionModel(TFSiglipPreTrainedModel):
         if getattr(self, "siglip", None) is not None:
             with tf.name_scope(self.siglip.name):
                 self.siglip.build(None)
+
+
+@add_start_docstrings(SIGLIP_START_DOCSTRING)
+class TFSiglipModel(TFSiglipPreTrainedModel):
+    config_class = SiglipConfig
+
+    def __init__(self, config: SiglipConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        self.siglip = TFSiglipMainLayer(config, name="siglip")
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(SIGLIP_TEXT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    def get_text_features(
+            self,
+            input_ids: TFModelInputType | None = None,
+            attention_mask: np.ndarray | tf.Tensor | None = None,
+            position_ids: np.ndarray | tf.Tensor | None = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            training: bool = False,
+    ) -> tf.Tensor:
+        r"""
+        Returns:
+            text_features (`tf.Tensor` of shape `(batch_size, output_dim`): The text embeddings obtained by applying
+            the projection layer to the pooled output of [`TFSiglipTextModel`].
+
+        Examples:
+
+        ```python
+        >>> from transformers import AutoTokenizer, TFSiglipModel
+
+        >>> model = TFSiglipModel.from_pretrained("google/siglip-base-patch16-224")
+        >>> tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-224")
+
+        >>> inputs = tokenizer(["a photo of a cat", "a photo of a dog"], padding=True, return_tensors="tf")
+        >>> text_features = model.get_text_features(**inputs)
+        ```"""
+
+        text_features = self.siglip.get_text_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        return text_features
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(SIGLIP_VISION_INPUTS_DOCSTRING)
+    def get_image_features(
+            self,
+            pixel_values: TFModelInputType | None = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            interpolate_pos_encoding: bool = False,
+            training: bool = False,
+    ) -> tf.Tensor:
+        r"""
+        Returns:
+            image_features (`tf.Tensor` of shape `(batch_size, output_dim`): The image embeddings obtained by applying
+            the projection layer to the pooled output of [`TFCLIPVisionModel`].
+
+        Examples:
+
+        ```python
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, TFSiglipModel
+
+        >>> model = TFSiglipModel.from_pretrained("google/siglip-base-patch16-224")
+        >>> processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
+
+        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(images=image, return_tensors="tf")
+
+        >>> image_features = model.get_image_features(**inputs)
+        ```"""
+
+        image_features = self.siglip.get_image_features(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+        )
+
+        return image_features
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(SIGLIP_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @replace_return_docstrings(output_type=TFSiglipOutput, config_class=SiglipConfig)
+    def call(
+            self,
+            input_ids: TFModelInputType | None = None,
+            pixel_values: TFModelInputType | None = None,
+            attention_mask: np.ndarray | tf.Tensor | None = None,
+            position_ids: np.ndarray | tf.Tensor | None = None,
+            return_loss: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            interpolate_pos_encoding: bool = False,
+            training: bool = False,
+    ) -> Union[TFSiglipOutput, Tuple[tf.Tensor]]:
+        r"""
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> import tensorflow as tf
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, TFSiglipModel
+
+        >>> model = TFSiglipModel.from_pretrained("google/siglip-base-patch16-224")
+        >>> processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
+
+        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(
+        ...     text=["a photo of a cat", "a photo of a dog"], images=image, return_tensors="tf", padding=True
+        ... )
+
+        >>> outputs = model(**inputs)
+        >>> logits_per_image = outputs.logits_per_image  # this is the image-text similarity score
+        >>> probs = tf.nn.sigmoid(logits_per_image, axis=1)  # these are probabilities
+        ```"""
+
+        outputs = self.siglip(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_loss=return_loss,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+        )
+
+        return outputs
+
+    def serving_output(self, output: TFSiglipOutput) -> TFSiglipOutput:
+        # TODO: As is this currently fails with saved_model=True, because
+        # TensorFlow cannot trace through nested dataclasses. Reference:
+        # https://github.com/huggingface/transformers/pull/16886
+        return output
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "siglip", None) is not None:
+            with tf.name_scope(self.siglip.name):
+                self.siglip.build(None)
+
+
+
+
+
 
 
 

@@ -86,7 +86,7 @@ def contrastive_loss(logits: tf.Tensor) -> tf.Tensor:
 def siglip_loss(similarity: tf.Tensor) -> tf.Tensor:
     caption_loss = contrastive_loss(similarity)
     image_loss = contrastive_loss(tf.transpose(similarity))
-    return (caption_loss + image_loss )/ 2.0
+    return (caption_loss + image_loss) / 2.0
 
 
 @dataclass

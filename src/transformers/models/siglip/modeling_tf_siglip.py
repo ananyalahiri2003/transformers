@@ -134,14 +134,14 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
+        init_range = getattr(self.config, "initializer_range", 0.02)
         self.patch_embedding = keras.layers.Conv2D(
             filters=self.embed_dim,
             kernel_size=self.patch_size,
             strides=self.patch_size,
             padding="valid",
             data_format="channels_last",
-            use_bias=False,
-            kernel_initializer=get_initializer(self.config.initializer_range * self.config.initializer_factor),
+            kernel_initializer=get_initializer(init_range),
             name="patch_embedding",
         )
 
@@ -250,7 +250,7 @@ class TFSiglipTextEmbeddings(keras.layers.Layer):
         with tf.name_scope("token_embedding"):
             self.weight = self.add_weight(
                 shape=(self.config.vocab_size, self.embed_dim),
-                initializer=get_initializer(self.config.initializer_factor * self.config.initializer_range),
+                initializer=get_initializer(self.config.initializer_range),
                 trainable=True,
                 name="weight",
             )
@@ -258,7 +258,7 @@ class TFSiglipTextEmbeddings(keras.layers.Layer):
         with tf.name_scope("position_embedding"):
             self.position_embedding = self.add_weight(
                 shape=(self.config.max_position_embeddings, self.embed_dim),
-                initializer=get_initializer(self.config.initializer_factor * self.config.initializer_range),
+                initializer=get_initializer(self.config.initializer_range),
                 trainable=True,
                 name="embeddings",
             )
@@ -846,7 +846,7 @@ class TFSiglipMultiheadAttentionPoolingHead(keras.layers.Layer):
                 self.mlp.build([None, None, self.config.hidden_size])
 
 
-@keras.serializable
+# @keras.serializable
 class TFSiglipVisionMainLayer(keras.layers.Layer):
     config_class = SiglipVisionConfig
 
@@ -889,7 +889,7 @@ class TFSiglipVisionMainLayer(keras.layers.Layer):
                 self.vision_model.build(None)
 
 
-@keras.serializable
+# @keras.serializable
 class TFSiglipMainLayer(keras.layers.Layer):
     config_class = SiglipConfig
 

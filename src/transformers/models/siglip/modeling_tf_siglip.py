@@ -913,24 +913,9 @@ class TFSiglipMainLayer(keras.layers.Layer):
         text_config = config.text_config
         vision_config = config.vision_config
 
-        self.projection_dim = config.projection_dim
-
         self.text_model = TFSiglipTextTransformer(text_config, name="text_model")
         self.vision_model = TFSiglipVisionTransformer(vision_config, name="vision_model")
 
-        self.visual_projection = keras.layers.Dense(
-            units=self.projection_dim,
-            kernel_initializer=get_initializer(vision_config.hidden_size ** -0.5 * self.config.initializer_factor),
-            use_bias=False,
-            name="visual_projection",
-        )
-
-        self.text_projection = keras.layers.Dense(
-            units=self.projection_dim,
-            kernel_initializer=get_initializer(text_config.hidden_size ** -0.5 * self.config.initializer_factor),
-            use_bias=False,
-            name="text_projection",
-        )
         self.text_embed_dim = text_config.hidden_size
         self.vision_embed_dim = vision_config.hidden_size
 
@@ -952,12 +937,6 @@ class TFSiglipMainLayer(keras.layers.Layer):
         if getattr(self, "vision_model", None) is not None:
             with tf.name_scope(self.vision_model.name):
                 self.vision_model.build(None)
-        if getattr(self, "visual_projection", None) is not None:
-            with tf.name_scope(self.visual_projection.name):
-                self.visual_projection.build([None, None, self.vision_embed_dim])
-        if getattr(self, "text_projection", None) is not None:
-            with tf.name_scope(self.text_projection.name):
-                self.text_projection.build([None, None, self.text_embed_dim])
 
     @unpack_inputs
     def get_text_features(
@@ -989,9 +968,8 @@ class TFSiglipMainLayer(keras.layers.Layer):
         )
 
         pooled_output = text_outputs[1]
-        text_features = self.text_projection(inputs=pooled_output)
 
-        return text_features
+        return pooled_output
 
     @unpack_inputs
     def get_image_features(
@@ -1014,9 +992,8 @@ class TFSiglipMainLayer(keras.layers.Layer):
         )
 
         pooled_output = vision_outputs[1]  # pooled_output
-        image_features = self.visual_projection(inputs=pooled_output)
 
-        return image_features
+        return pooled_output
 
     @unpack_inputs
     def call(
@@ -1029,6 +1006,7 @@ class TFSiglipMainLayer(keras.layers.Layer):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        interpolate_pos_encoding: bool = False,
         training: bool = False,
     ) -> Union[TFSiglipOutput, Tuple[tf.Tensor]]:
         if input_ids is None:
@@ -1046,6 +1024,7 @@ class TFSiglipMainLayer(keras.layers.Layer):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            interpolate_pos_encoding=interpolate_pos_encoding,
             training=training,
         )
 
@@ -1060,24 +1039,29 @@ class TFSiglipMainLayer(keras.layers.Layer):
         )
 
         image_embeds = vision_outputs[1]
-        image_embeds = self.visual_projection(inputs=image_embeds)
-
         text_embeds = text_outputs[1]
-        text_embeds = self.text_projection(inputs=text_embeds)
 
         # normalized features
         image_embeds = image_embeds / tf.norm(tensor=image_embeds, ord="euclidean", axis=-1, keepdims=True)
         text_embeds = text_embeds / tf.norm(tensor=text_embeds, ord="euclidean", axis=-1, keepdims=True)
 
         # cosine similarity as logits
-        logit_scale = tf.math.exp(self.logit_scale)
-        logits_per_text = tf.matmul(text_embeds, image_embeds, transpose_b=True) * logit_scale
+        logits_per_text = (
+                tf.matmul(
+                    text_embeds, image_embeds, transpose_b=True
+                ) * self.logit_scale.exp() * self.logit_bias
+                + self.logit_bias
+        )
+
         logits_per_image = tf.transpose(logits_per_text)
 
         loss = None
         if return_loss:
-            loss = siglip_loss(logits_per_text)
-            loss = tf.reshape(loss, (1,))
+            eye = tf.eye(tf.shape(logits_per_text)[0], dtype=logits_per_text.dtype)
+            m1_diag1 = -tf.ones_like(logits_per_text) * 2 * eye
+            loglik = tf.math.log_sigmoid(m1_diag1 * logits_per_text)
+            nll = -tf.reduce_sum(loglik, axis=-1)
+            loss = tf.reduce_mean(nll)
 
         if not return_dict:
             output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)

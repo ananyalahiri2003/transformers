@@ -88,7 +88,7 @@ class SiglipTextConfig(PretrainedConfig):
         num_hidden_layers=12,
         num_attention_heads=12,
         max_position_embeddings=64,
-        hidden_act="gelu_pytorch_tanh",
+        hidden_act="gelu",
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
         # This differs from `CLIPTokenizer`'s default and from openai/siglip

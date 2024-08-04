@@ -151,14 +151,14 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
         self.position_embedding = keras.layers.Embedding(
             input_dim=self.num_positions,
             output_dim=self.embed_dim,
-            embeddings_initializer=get_initializer(self.config.initializer_range),
+            embeddings_initializer=get_initializer(init_range),
             name="position_embedding",
         )
 
         self.position_ids = tf.range(start=0, limit=self.num_positions)
 
     def build(self, input_shape: tf.TensorShape = None):
-        factor = self.config.initializer_factor
+        factor = 1.0
 
         self.class_embedding = self.add_weight(
             shape=(self.embed_dim,),
@@ -311,9 +311,8 @@ class TFSiglipAttention(keras.layers.Layer):
                 f" {self.num_attention_heads})."
             )
 
-        factor = config.initializer_factor
-        in_proj_std = (self.embed_dim**-0.5) * ((2 * config.num_hidden_layers) ** -0.5) * factor
-        out_proj_std = (self.embed_dim**-0.5) * factor
+        in_proj_std = (self.embed_dim**-0.5) * ((2 * config.num_hidden_layers) ** -0.5)
+        out_proj_std = (self.embed_dim**-0.5)
 
         self.sqrt_att_head_size = math.sqrt(self.attention_head_size)
 
@@ -422,11 +421,11 @@ class TFSiglipMLP(keras.layers.Layer):
     def __init__(self, config: SiglipConfig, **kwargs):
         super().__init__(**kwargs)
 
-        self.activation_fn = get_tf_activation(config.hidden_act)
+        # self.activation_fn = get_tf_activation(config.hidden_act)
+        self.activation_fn = get_tf_activation("quick_gelu")
 
-        factor = config.initializer_factor
-        in_proj_std = (config.hidden_size**-0.5) * ((2 * config.num_hidden_layers) ** -0.5) * factor
-        fc_std = (2 * config.hidden_size) ** -0.5 * factor
+        in_proj_std = (config.hidden_size**-0.5) * ((2 * config.num_hidden_layers) ** -0.5)
+        fc_std = (2 * config.hidden_size) ** -0.5
 
         self.fc1 = keras.layers.Dense(
             units=config.intermediate_size, kernel_initializer=get_initializer(fc_std), name="fc1"
@@ -788,9 +787,8 @@ class TFSiglipMultiheadAttentionPoolingHead(keras.layers.Layer):
         # Multihead Attention Layer
         self.attention = tf.keras.layers.MultiHeadAttention(
             num_heads=config.num_attention_heads,
-            key_dim=config.hidden_state,
+            key_dim=config.hidden_size,
             dropout=0.1,
-            batch_first=True,
             name="multihead_attention",
         )
 

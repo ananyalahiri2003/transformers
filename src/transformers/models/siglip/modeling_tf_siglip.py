@@ -914,16 +914,22 @@ class TFSiglipMainLayer(keras.layers.Layer):
         self.text_model = TFSiglipTextTransformer(text_config, name="text_model")
         self.vision_model = TFSiglipVisionTransformer(vision_config, name="vision_model")
 
-        self.text_embed_dim = text_config.hidden_size
-        self.vision_embed_dim = vision_config.hidden_size
+        # self.text_embed_dim = text_config.hidden_size
+        # self.vision_embed_dim = vision_config.hidden_size
 
-    # Copied from transformers.models.clip.modeling_clip.TFCLIPMainLayer
     def build(self, input_shape: tf.TensorShape = None):
         self.logit_scale = self.add_weight(
             shape=(1,),
-            initializer=keras.initializers.Constant(self.config.logit_scale_init_value),
+            initializer=keras.initializers.RandomNormal(mean=0.0, stddev=1.0),
             trainable=True,
             name="logit_scale",
+        )
+
+        self.logit_bias = self.add_weight(
+            shape=(1,),
+            initializer=keras.initializers.RandomNormal(mean=0.0, stddev=1.0),
+            trainable=True,
+            name="logit_bias",
         )
 
         if self.built:

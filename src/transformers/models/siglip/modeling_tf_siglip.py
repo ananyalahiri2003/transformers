@@ -228,6 +228,8 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
         if interpolate_pos_encoding:
             patch_embeds = patch_embeds + self.interpolate_pos_encoding(patch_embeds, height, width)
         else:
+            # Correctly slice the position_ids to match the shape of patch_embeds
+            position_ids = self.position_ids[:, :tf.shape(patch_embeds)[1]]
             patch_embeds = patch_embeds + self.position_embedding(self.position_ids)
         return patch_embeds
 

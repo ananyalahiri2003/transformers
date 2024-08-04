@@ -148,14 +148,7 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
 
-        # self.position_embedding = keras.layers.Embedding(
-        #     input_dim=self.num_positions,
-        #     output_dim=self.embed_dim,
-        #     embeddings_initializer=get_initializer(init_range),
-        #     name="position_embedding",
-        # )
-        #
-        # self.position_ids = tf.range(start=0, limit=self.num_positions)
+        self.position_ids = tf.range(start=0, limit=self.num_positions)
 
     def build(self, input_shape: tf.TensorShape = None):
         factor = 1.0

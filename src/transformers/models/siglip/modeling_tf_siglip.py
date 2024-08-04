@@ -167,10 +167,11 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
             name="class_embedding",
         )
 
+        init_range = getattr(self.config, "initializer_range", 0.02)
         with tf.name_scope("position_embedding"):
             self.position_embedding = self.add_weight(
                 shape=(self.num_positions, self.embed_dim),
-                initializer=get_initializer(self.config.initializer_range * factor),
+                initializer=get_initializer(init_range * factor),
                 trainable=True,
                 name="embeddings",
             )
@@ -247,10 +248,11 @@ class TFSiglipTextEmbeddings(keras.layers.Layer):
         self.config = config
 
     def build(self, input_shape: tf.TensorShape = None):
+        init_range = getattr(self.config, "initializer_range", 0.02)
         with tf.name_scope("token_embedding"):
             self.weight = self.add_weight(
                 shape=(self.config.vocab_size, self.embed_dim),
-                initializer=get_initializer(self.config.initializer_range),
+                initializer=get_initializer(init_range),
                 trainable=True,
                 name="weight",
             )
@@ -258,7 +260,7 @@ class TFSiglipTextEmbeddings(keras.layers.Layer):
         with tf.name_scope("position_embedding"):
             self.position_embedding = self.add_weight(
                 shape=(self.config.max_position_embeddings, self.embed_dim),
-                initializer=get_initializer(self.config.initializer_range),
+                initializer=get_initializer(init_range),
                 trainable=True,
                 name="embeddings",
             )

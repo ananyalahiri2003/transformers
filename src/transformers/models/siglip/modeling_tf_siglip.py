@@ -43,7 +43,6 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
 
@@ -54,7 +53,99 @@ _CONFIG_FOR_DOC = "SiglipConfig"
 _CHECKPOINT_FOR_DOC = "google/siglip-base-patch16-224"
 
 
-LARGE_NEGATIVE = 1e-8    # CHECK
+LARGE_NEGATIVE = 1e-8
+
+
+def _trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
+    """Fills a tensor with values drawn from a truncated normal distribution.
+    The values are drawn from the normal distribution N with mean and std,
+    truncated to [a, b]. """
+    def norm_cdf(x):
+        """# Computes standard normal cumulative distribution function"""
+        return (1.0 + tf.math.erf(x / tf.sqrt(2.0))) / 2.0
+
+    if (mean < a - 2 * std) or (mean > b + 2 * std):
+        tf.print(
+            "Warning: mean is more than 2 std from [a, b]. The distribution of values may be incorrect."
+        )
+
+    # Get upper and lower cdf values
+    l = norm_cdf((a - mean) / std)
+    u = norm_cdf((b - mean) / std)
+
+    # Uniformly fill tensor with values from [l, u], then translate to
+    # [2l-1, 2u-1].
+    tensor.assign(tf.random.uniform(tensor.shape, minval=2 * l - 1, maxval=2 * u-1))
+    tensor.assign(tf.math.erfinv(tensor))
+
+    # Scale and shift
+    tensor.assign(tensor * (std * tf.sqrt(2.0)))
+    tensor.assign(tensor + mean)
+
+    # Clamp values to ensire they are within [a, b]
+    tensor.assign(tf.clip_by_value(tensor, clip_value_min=a, clip_value_max=b))
+
+
+def trunc_normal_tf_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
+    """Fills the input Tensor with values drawn from a truncated
+    normal distribution. The values are effectively drawn from the
+    normal distribution :math:`\\mathcal{N}(\text{mean}, \text{std}^2)`
+    with values outside :math:`[a, b]` redrawn until they are within
+    the bounds. The method used for generating the random values works
+    best when :math:`a \\leq \text{mean} \\leq b`.
+
+    Args:
+        tensor: an n-dimensional `tf.Tensor`
+        mean: the mean of the normal distribution
+        std: the standard deviation of the normal distribution
+        a: the minimum cutoff value
+        b: the maximum cutoff value
+    """
+    _trunc_normal_(tensor, 0, 1.0, a, b)
+    return tensor * std + mean
+
+
+def variance_scaling_(tensor, scale=1.0, mode="fan_in", distribution="normal"):
+    """Initializes a tensor using variance scaling based on the mode and distribution."""
+    fan_in = tf.keras.initializers.VarianceScaling(
+        scale=scale,       # Equivalent to scale in your function
+        mode="fan_in",   
+        distribution=distribution
+    )
+
+    fan_out = tf.keras.initializers.VarianceScaling(
+        scale=scale,  # Equivalent to scale in your function
+        mode="fan_out",
+        distribution=distribution
+    )
+    
+    if mode == "fan_in":
+        denom = fan_in
+    elif mode == "fan_out":
+        denom = fan_out
+    elif mode == "fan_avg":
+        denom = (fan_in + fan_out / 2)
+
+    variance = scale / denom
+
+    if distribution == "truncated_normal":
+        # constant is stddev of standard normal truncated to (-2, 2)
+        trunc_normal_tf_(tensor, std=tf.math.sqrt(variance) / 0.87962566103423978)
+    elif distribution == "normal":
+        tensor.normal_(std=tf.math.sqrt(variance))
+    elif distribution == "uniform":
+        bound = tf.math.sqrt(3 * variance)
+        tensor.uniform_(-bound, bound)
+    else:
+        raise ValueError(f"invalid distribution {distribution}")
+
+
+def lecun_normal_(tensor):
+    variance_scaling_(tensor, mode="fan_in", distribution="truncated_normal")
+
+
+def default_flax_embed_init(tensor):
+    variance_scaling_(tensor, mode="fan_in", distribution="normal")
 
 
 # Copied from transformers.models.bart.modeling_tf_bart._expand_mask
@@ -146,19 +237,53 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches + 1
+        self.num_positions = self.num_patches
 
         self.position_ids = tf.range(start=0, limit=self.num_positions)
 
-    def build(self, input_shape: tf.TensorShape = None):
-        factor = 1.0
+    def interpolate_pos_encoding(self, embeddings, height, width):
+        """
+        This method is an adapted method for SigLIP (due to SigLIP not having class embedding unlike other ViTs)
+        that allows the model to interpolate the pre-trained position encodings such that it can be usable on
+        higher resolution images.
 
-        self.class_embedding = self.add_weight(
-            shape=(self.embed_dim,),
-            initializer=get_initializer(self.embed_dim**-0.5 * factor),
-            trainable=True,
-            name="class_embedding",
+        Source:
+        https://github.com/facebookresearch/dino/blob/de9ee3df6cf39fac952ab558447af1fa1365362a/vision_transformer.py#L174
+        """
+        position_embeddings = tf.expand_dims(self.position_embedding, 0)
+        num_patches = tf.shape(embeddings)[1]
+        num_positions = tf.shape(position_embeddings)[1]
+        if num_patches == num_positions and height == width:
+            return position_embeddings
+
+        dim = tf.shape(embeddings)[-1]
+        height = height // self.patch_size
+        width = width // self.patch_size
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        height, width = height + 0.1, width + 0.1
+
+        patch_pos_embed = tf.reshape(
+            position_embeddings,
+            (1, int(math.sqrt(num_positions)), int(math.sqrt(num_positions)), dim)
         )
+        patch_pos_embed = tf.transpose(patch_pos_embed, perm=[0, 3, 1, 2])
+        patch_pos_embed = tf.image.resize(
+            patch_pos_embed,
+            size=(int(height), int(width)),
+            method='bicubic'
+        )
+
+        if int(height) != tf.shape(patch_pos_embed)[-2] or int(width) != tf.shape(patch_pos_embed)[-1]:
+            raise ValueError("Width or height does not match with the interpolated position embeddings")
+
+        patch_pos_embed = tf.transpose(patch_pos_embed, perm=[0, 2, 3, 1])
+        patch_pos_embed = tf.reshape(patch_pos_embed, (1, -1, dim))
+
+        return patch_pos_embed
+
+    def build(self, input_shape: tf.TensorShape = None):
+        factor = getattr(self.config, "initializer_factor", 1.0)
 
         init_range = getattr(self.config, "initializer_range", 0.02)
         with tf.name_scope("position_embedding"):
@@ -175,41 +300,6 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
         if getattr(self, "patch_embedding", None) is not None:
             with tf.name_scope(self.patch_embedding.name):
                 self.patch_embedding.build([None, None, None, self.config.num_channels])
-
-    def interpolate_pos_encoding(self, embeddings, height, width, position_embedding):
-        """
-        This method is an adapted method for SigLIP (due to SigLIP not having class embedding unlike other ViTs)
-        that allows the model to interpolate the pre-trained position encodings such that it can be usable on
-        higher resolution images.
-
-        Source:
-        https://github.com/facebookresearch/dino/blob/de9ee3df6cf39fac952ab558447af1fa1365362a/vision_transformer.py#L174
-        """
-        position_embeddings = tf.expand_dims(position_embedding, 0)
-        num_patches = tf.shape(embeddings)[1]
-        num_positions = tf.shape(position_embeddings)[1]
-        if num_patches == num_positions and height == width:
-            return position_embeddings
-
-        dim = tf.shape(embeddings)[-1]
-        height = height // self.patch_size
-        width = width // self.patch_size
-        # we add a small number to avoid floating point error in the interpolation
-        # see discussion at https://github.com/facebookresearch/dino/issues/8
-        height, width = height + 0.1, width + 0.1
-
-        patch_pos_embed = tf.reshape(position_embeddings,
-                                     (1, int(math.sqrt(num_positions)), int(math.sqrt(num_positions)), dim))
-        patch_pos_embed = tf.transpose(patch_pos_embed, perm=[0, 3, 1, 2])
-        patch_pos_embed = tf.image.resize(patch_pos_embed, size=(int(height), int(width)), method='bicubic')
-
-        if int(height) != tf.shape(patch_pos_embed)[-2] or int(width) != tf.shape(patch_pos_embed)[-1]:
-            raise ValueError("Width or height does not match with the interpolated position embeddings")
-
-        patch_pos_embed = tf.transpose(patch_pos_embed, perm=[0, 2, 3, 1])
-        patch_pos_embed = tf.reshape(patch_pos_embed, (1, -1, dim))
-
-        return patch_pos_embed
 
     def call(self, pixel_values: tf.Tensor, interpolate_pos_encoding: bool) -> tf.Tensor:
         """`pixel_values` is expected to be of NCHW format."""
@@ -230,7 +320,7 @@ class TFSiglipVisionEmbeddings(keras.layers.Layer):
         else:
             # Correctly slice the position_ids to match the shape of patch_embeds
             position_ids = self.position_ids[:, :tf.shape(patch_embeds)[1]]
-            patch_embeds = patch_embeds + self.position_embedding(self.position_ids)
+            patch_embeds = patch_embeds + self.position_embedding(position_ids)
         return patch_embeds
 
 

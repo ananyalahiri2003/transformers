@@ -333,11 +333,12 @@ class TFSiglipTextEmbeddings(keras.layers.Layer):
         self.config = config
 
     def build(self, input_shape: tf.TensorShape = None):
+        factor = getattr(self.config, "initializer_factor", 1.0)
         init_range = getattr(self.config, "initializer_range", 0.02)
         with tf.name_scope("token_embedding"):
             self.weight = self.add_weight(
                 shape=(self.config.vocab_size, self.embed_dim),
-                initializer=get_initializer(init_range),
+                initializer=get_initializer(init_range * factor),
                 trainable=True,
                 name="weight",
             )
@@ -345,7 +346,7 @@ class TFSiglipTextEmbeddings(keras.layers.Layer):
         with tf.name_scope("position_embedding"):
             self.position_embedding = self.add_weight(
                 shape=(self.config.max_position_embeddings, self.embed_dim),
-                initializer=get_initializer(init_range),
+                initializer=get_initializer(init_range * factor),
                 trainable=True,
                 name="embeddings",
             )
@@ -398,8 +399,9 @@ class TFSiglipAttention(keras.layers.Layer):
                 f" {self.num_attention_heads})."
             )
 
-        in_proj_std = (self.embed_dim**-0.5) * ((2 * config.num_hidden_layers) ** -0.5)
-        out_proj_std = (self.embed_dim**-0.5)
+        factor = getattr(self.config, "initializer_factor", 1.0)
+        in_proj_std = (self.embed_dim**-0.5) * ((2 * config.num_hidden_layers) ** -0.5) * factor
+        out_proj_std = (self.embed_dim**-0.5) * factor
 
         self.sqrt_att_head_size = math.sqrt(self.attention_head_size)
 
@@ -436,18 +438,18 @@ class TFSiglipAttention(keras.layers.Layer):
         """Input shape: Batch x Time x Channel"""
 
         batch_size, q_len, _ = shape_list(hidden_states)
-        query_states = self.q_proj(inputs=hidden_states)
-        key_states = self.k_proj(inputs=hidden_states)
-        value_states = self.v_proj(inputs=hidden_states)
+        query_layer = self.q_proj(inputs=hidden_states)
+        key_layer = self.k_proj(inputs=hidden_states)
+        value_layer = self.v_proj(inputs=hidden_states)
 
-        query_states = self.transpose_for_scores(query_states, batch_size)
-        key_states = self.transpose_for_scores(key_states, batch_size)
-        value_states = self.transpose_for_scores(value_states, batch_size)
+        query_layer = self.transpose_for_scores(query_layer, batch_size)
+        key_layer = self.transpose_for_scores(key_layer, batch_size)
+        value_layer = self.transpose_for_scores(value_layer, batch_size)
 
-        k_v_seq_len = shape_list(key_states)[2]
+        k_v_seq_len = shape_list(key_layer)[2]
         # Take the dot product between "query" and "key" to get the raw attention scores.
         # (batch size, num_heads, seq_len_q, seq_len_k)
-        attention_scores = tf.matmul(query_states, key_states, transpose_b=True)
+        attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
         dk = tf.cast(self.sqrt_att_head_size, dtype=attention_scores.dtype)
         attention_scores = tf.divide(attention_scores, dk)
 
@@ -467,11 +469,12 @@ class TFSiglipAttention(keras.layers.Layer):
 
         # Normalize the attention scores to probabilities.
         _attention_probs = stable_softmax(logits=attention_scores, axis=-1)
+        _attention_probs = tf.cast(_attention_probs, dtype=query_layer.dtype)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.dropout(inputs=_attention_probs, training=training)
-        attention_output = tf.matmul(attention_probs, value_states)
+        attention_output = tf.matmul(attention_probs, value_layer)
 
         attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])
 
@@ -479,8 +482,7 @@ class TFSiglipAttention(keras.layers.Layer):
         attention_output = tf.reshape(tensor=attention_output, shape=(batch_size, q_len, self.embed_dim))
 
         attention_output = self.out_proj(attention_output, training=training)
-        # In TFBert, attention weights are returned after dropout.
-        # However, in CLIP, they are returned before dropout.
+
         outputs = (attention_output, _attention_probs) if output_attentions else (attention_output,)
 
         return outputs
@@ -511,8 +513,9 @@ class TFSiglipMLP(keras.layers.Layer):
         # self.activation_fn = get_tf_activation(config.hidden_act)
         self.activation_fn = get_tf_activation("quick_gelu")
 
-        in_proj_std = (config.hidden_size**-0.5) * ((2 * config.num_hidden_layers) ** -0.5)
-        fc_std = (2 * config.hidden_size) ** -0.5
+        factor = getattr(self.config, "initializer_factor", 1.0)
+        in_proj_std = (config.hidden_size**-0.5) * ((2 * config.num_hidden_layers) ** -0.5) * factor
+        fc_std = (2 * config.hidden_size) ** -0.5 * factor
 
         self.fc1 = keras.layers.Dense(
             units=config.intermediate_size, kernel_initializer=get_initializer(fc_std), name="fc1"

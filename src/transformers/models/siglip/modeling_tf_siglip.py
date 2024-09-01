@@ -619,7 +619,6 @@ class TFSiglipEncoder(keras.layers.Layer):
 
     def __init__(self, config: SiglipConfig, **kwargs):
         super().__init__(**kwargs)
-
         self.layers = [TFSiglipEncoderLayer(config, name=f"layers_._{i}") for i in range(config.num_hidden_layers)]
 
     def call(
